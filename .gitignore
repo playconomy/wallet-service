@@ -1,0 +1,97 @@
+# Binaries for programs and plugins
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+bin/
+dist/
+
+# Test binary, built with `go test -c`
+*.test
+
+# Output of the go coverage tool
+*.out
+coverage.html
+
+# IDE specific files
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Environment variables
+.env
+.env.local
+.env.*.local
+
+# Except example env file
+!profiles/default.env
+
+# Dependency directories (remove if using go modules)
+vendor/
+
+# Go workspace file
+go.work
+
+# Binary output directories
+_output/
+_build/
+
+# Logs
+*.log
+logs/
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Temporary files
+tmp/
+temp/
+
+# Database files
+*.db
+*.sqlite
+*.sqlite3
+
+# Debug files
+__debug_bin
+debug.test
+
+# Docker volumes
+docker/data/
+docker/postgres-data/
+
+# Configuration except examples
+config/*.yaml
+config/*.yml
+!config/*.example.yaml
+!config/*.example.yml
+
+# Generated files
+*.gen.go
+*_string.go
+mock_*.go
+
+# Test cache
+.testCoverage.txt
+
+# Air live reload
+.air.toml
+tmp/
+
+# Swagger temporary files
+.swagger-temp/
+
+# Except swagger docs
+!docs/
+!docs/swagger.json
+!docs/swagger.yaml
+!docs/docs.go

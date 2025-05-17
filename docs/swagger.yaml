@@ -1,0 +1,380 @@
+basePath: /
+definitions:
+  dto.ExchangeRequest:
+    description: Request for token exchange
+    properties:
+      amount:
+        example: 150
+        type: number
+      game_id:
+        example: game-abc
+        minLength: 1
+        type: string
+      source:
+        enum:
+        - won
+        - purchased
+        example: won
+        type: string
+      token_type:
+        example: gold
+        minLength: 1
+        type: string
+      user_id:
+        example: 123
+        type: integer
+    required:
+    - amount
+    - game_id
+    - source
+    - token_type
+    - user_id
+    type: object
+  dto.ExchangeResponse:
+    description: Response for exchange operations
+    properties:
+      error:
+        example: ""
+        type: string
+      new_balance:
+        example: 165.5
+        type: number
+      success:
+        example: true
+        type: boolean
+    type: object
+  dto.GenericResponse:
+    description: Generic API response
+    properties:
+      error:
+        example: Authentication required
+        type: string
+      success:
+        example: false
+        type: boolean
+    type: object
+  dto.SpendRequest:
+    description: Request for token spending
+    properties:
+      amount:
+        example: 50
+        type: number
+      reason:
+        enum:
+        - market_purchase
+        - competition_entry
+        example: market_purchase
+        type: string
+      reference_id:
+        example: ORDER-99887
+        minLength: 1
+        type: string
+      user_id:
+        example: 123
+        type: integer
+    required:
+    - amount
+    - reason
+    - reference_id
+    - user_id
+    type: object
+  dto.SpendResponse:
+    description: Response for spend operations
+    properties:
+      error:
+        example: ""
+        type: string
+      new_balance:
+        example: 100.5
+        type: number
+      success:
+        example: true
+        type: boolean
+    type: object
+  dto.Wallet:
+    description: User wallet information
+    properties:
+      balance:
+        example: 150.5
+        minimum: 0
+        type: number
+      created_at:
+        example: "2025-05-16T20:00:00Z"
+        type: string
+      id:
+        example: 1
+        type: integer
+      user_id:
+        example: 123
+        type: integer
+    required:
+    - id
+    - user_id
+    type: object
+  dto.WalletLogEntry:
+    description: Wallet transaction log entry
+    properties:
+      converted_amount:
+        example: 15
+        type: number
+      created_at:
+        example: "2025-05-16T20:00:00Z"
+        type: string
+      game_id:
+        example: game-abc
+        type: string
+      operation:
+        enum:
+        - exchange
+        - spend
+        example: exchange
+        type: string
+      original_amount:
+        example: 150
+        minimum: 0
+        type: number
+      reference_id:
+        example: ORDER-99887
+        type: string
+      source:
+        example: won
+        type: string
+      token_type:
+        example: gold
+        type: string
+    required:
+    - operation
+    type: object
+  dto.WalletLogsResponse:
+    description: Response for wallet logs
+    properties:
+      data:
+        items:
+          $ref: '#/definitions/dto.WalletLogEntry'
+        type: array
+      error:
+        example: ""
+        type: string
+      success:
+        example: true
+        type: boolean
+    type: object
+  dto.WalletResponse:
+    description: Response for wallet information
+    properties:
+      data:
+        $ref: '#/definitions/dto.Wallet'
+      error:
+        example: ""
+        type: string
+      success:
+        example: true
+        type: boolean
+    type: object
+host: localhost:3000
+info:
+  contact:
+    email: support@example.com
+    name: API Support
+    url: http://www.example.com/support
+  description: This is a wallet service API for managing platform tokens
+  license:
+    name: Apache 2.0
+    url: http://www.apache.org/licenses/LICENSE-2.0.html
+  termsOfService: http://swagger.io/terms/
+  title: Wallet Service API
+  version: "1.0"
+paths:
+  /{user_id}:
+    get:
+      consumes:
+      - application/json
+      description: Returns wallet information for a specific user
+      parameters:
+      - description: User ID
+        in: path
+        name: user_id
+        required: true
+        type: integer
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: Wallet information
+          schema:
+            $ref: '#/definitions/dto.WalletResponse'
+        "400":
+          description: Invalid user ID
+          schema:
+            $ref: '#/definitions/dto.WalletResponse'
+        "401":
+          description: Unauthorized
+          schema:
+            $ref: '#/definitions/dto.GenericResponse'
+        "403":
+          description: Forbidden
+          schema:
+            $ref: '#/definitions/dto.WalletResponse'
+        "404":
+          description: Wallet not found
+          schema:
+            $ref: '#/definitions/dto.WalletResponse'
+        "500":
+          description: Server error
+          schema:
+            $ref: '#/definitions/dto.WalletResponse'
+      security:
+      - ApiKeyAuth: []
+      - ApiEmailAuth: []
+      - ApiRoleAuth: []
+      summary: Get wallet information
+      tags:
+      - wallet
+  /{user_id}/logs:
+    get:
+      consumes:
+      - application/json
+      description: Returns transaction logs for a specific user wallet
+      parameters:
+      - description: User ID
+        in: path
+        name: user_id
+        required: true
+        type: integer
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: Wallet logs
+          schema:
+            $ref: '#/definitions/dto.WalletLogsResponse'
+        "400":
+          description: Invalid user ID
+          schema:
+            $ref: '#/definitions/dto.WalletLogsResponse'
+        "401":
+          description: Unauthorized
+          schema:
+            $ref: '#/definitions/dto.GenericResponse'
+        "403":
+          description: Forbidden
+          schema:
+            $ref: '#/definitions/dto.WalletLogsResponse'
+        "500":
+          description: Server error
+          schema:
+            $ref: '#/definitions/dto.WalletLogsResponse'
+      security:
+      - ApiKeyAuth: []
+      - ApiEmailAuth: []
+      - ApiRoleAuth: []
+      summary: Get wallet transaction logs
+      tags:
+      - wallet
+      - logs
+  /exchange:
+    post:
+      consumes:
+      - application/json
+      description: Converts game tokens to platform tokens and adds to wallet
+      parameters:
+      - description: Exchange request
+        in: body
+        name: request
+        required: true
+        schema:
+          $ref: '#/definitions/dto.ExchangeRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: Exchange result
+          schema:
+            $ref: '#/definitions/dto.ExchangeResponse'
+        "400":
+          description: Invalid request or exchange rate not found
+          schema:
+            $ref: '#/definitions/dto.ExchangeResponse'
+        "401":
+          description: Unauthorized
+          schema:
+            $ref: '#/definitions/dto.GenericResponse'
+        "403":
+          description: Forbidden
+          schema:
+            $ref: '#/definitions/dto.ExchangeResponse'
+        "500":
+          description: Server error
+          schema:
+            $ref: '#/definitions/dto.ExchangeResponse'
+      security:
+      - ApiKeyAuth: []
+      - ApiEmailAuth: []
+      - ApiRoleAuth: []
+      summary: Exchange game tokens
+      tags:
+      - wallet
+      - exchange
+  /spend:
+    post:
+      consumes:
+      - application/json
+      description: Deducts tokens from a user's wallet for purchases or entries
+      parameters:
+      - description: Spend request
+        in: body
+        name: request
+        required: true
+        schema:
+          $ref: '#/definitions/dto.SpendRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: Spend result
+          schema:
+            $ref: '#/definitions/dto.SpendResponse'
+        "400":
+          description: Invalid request, insufficient funds, or wallet not found
+          schema:
+            $ref: '#/definitions/dto.SpendResponse'
+        "401":
+          description: Unauthorized
+          schema:
+            $ref: '#/definitions/dto.GenericResponse'
+        "403":
+          description: Forbidden
+          schema:
+            $ref: '#/definitions/dto.SpendResponse'
+        "500":
+          description: Server error
+          schema:
+            $ref: '#/definitions/dto.SpendResponse'
+      security:
+      - ApiKeyAuth: []
+      - ApiEmailAuth: []
+      - ApiRoleAuth: []
+      summary: Spend tokens
+      tags:
+      - wallet
+      - spend
+schemes:
+- http
+- https
+securityDefinitions:
+  ApiEmailAuth:
+    description: User email for authentication
+    in: header
+    name: X-User-Email
+    type: apiKey
+  ApiKeyAuth:
+    description: User ID for authentication
+    in: header
+    name: X-User-Id
+    type: apiKey
+  ApiRoleAuth:
+    description: User role for authentication
+    in: header
+    name: X-User-Role
+    type: apiKey
+swagger: "2.0"
