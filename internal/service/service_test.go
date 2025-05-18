@@ -1,30 +1,49 @@
 package service
 
 import (
-	"database/sql"
+	"context"
 	"fmt"
 	"testing"
 	"time"
 
+	"github.com/playconomy/wallet-service/internal/model"
+	"github.com/playconomy/wallet-service/internal/observability"
+	"github.com/playconomy/wallet-service/internal/observability/metrics"
+	"github.com/playconomy/wallet-service/internal/observability/tracing"
+	"github.com/playconomy/wallet-service/internal/repository"
 	"github.com/playconomy/wallet-service/internal/server/dto"
 
-	"github.com/DATA-DOG/go-sqlmock"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/mock"
+	"go.uber.org/zap"
 )
 
-func setupTestDB(t *testing.T) (*sql.DB, sqlmock.Sqlmock, *WalletService) {
-	db, mock, err := sqlmock.New()
-	if err != nil {
-		t.Fatalf("An error '%s' was not expected when opening a stub database connection", err)
-	}
+// Mock observability components for testing
+type mockObservability struct {
+	logger  *zap.Logger
+	metrics *metrics.Metrics
+	tracer  *tracing.Tracer
+}
 
-	service := NewWalletService(db)
-	return db, mock, service
+func setupTestService(t *testing.T) (*repository.MockRepository, WalletServiceInterface) {
+	// Create mock repository
+	mockRepo := new(repository.MockRepository)
+
+	// Create test observability
+	obs := observability.NewTestObservability()
+
+	// Create service with mock repository
+	service := NewWalletService(mockRepo, obs)
+	
+	// Return the service as an interface to ensure we're testing the interface not the implementation
+	return mockRepo, service
 }
 
 func TestGetWalletByUserID(t *testing.T) {
-	db, mock, service := setupTestDB(t)
-	defer db.Close()
+	mockRepo, service := setupTestService(t)
+
+	// Create standard context for tests
+	ctx := context.Background()
 
 	// Define test cases
 	testCases := []struct {
@@ -38,11 +57,13 @@ func TestGetWalletByUserID(t *testing.T) {
 			name:   "Success - Wallet Found",
 			userID: 123,
 			mockSetup: func() {
-				rows := sqlmock.NewRows([]string{"id", "user_id", "balance", "created_at"}).
-					AddRow(1, 123, 500.50, time.Now())
-				mock.ExpectQuery("SELECT id, user_id, balance, created_at FROM wallets").
-					WithArgs(123).
-					WillReturnRows(rows)
+				mockWallet := &model.Wallet{
+					ID:        1,
+					UserID:    123,
+					Balance:   500.50,
+					CreatedAt: time.Now(),
+				}
+				mockRepo.On("GetWalletByUserID", mock.Anything, 123).Return(mockWallet, nil).Once()
 			},
 			expectedWallet: &dto.Wallet{
 				ID:      1,
@@ -55,9 +76,7 @@ func TestGetWalletByUserID(t *testing.T) {
 			name:   "Wallet Not Found",
 			userID: 456,
 			mockSetup: func() {
-				mock.ExpectQuery("SELECT id, user_id, balance, created_at FROM wallets").
-					WithArgs(456).
-					WillReturnError(sql.ErrNoRows)
+				mockRepo.On("GetWalletByUserID", mock.Anything, 456).Return(nil, nil).Once()
 			},
 			expectedWallet: nil,
 			expectError:    false,
@@ -66,9 +85,7 @@ func TestGetWalletByUserID(t *testing.T) {
 			name:   "Database Error",
 			userID: 789,
 			mockSetup: func() {
-				mock.ExpectQuery("SELECT id, user_id, balance, created_at FROM wallets").
-					WithArgs(789).
-					WillReturnError(fmt.Errorf("database connection lost"))
+				mockRepo.On("GetWalletByUserID", mock.Anything, 789).Return(nil, fmt.Errorf("database connection lost")).Once()
 			},
 			expectedWallet: nil,
 			expectError:    true,
@@ -81,7 +98,7 @@ func TestGetWalletByUserID(t *testing.T) {
 			tc.mockSetup()
 
 			// Call the service method
-			wallet, err := service.GetWalletByUserID(tc.userID)
+			wallet, err := service.GetWalletByUserID(ctx, tc.userID)
 
 			// Check results
 			if tc.expectError {
@@ -98,13 +115,16 @@ func TestGetWalletByUserID(t *testing.T) {
 				assert.Equal(t, tc.expectedWallet.UserID, wallet.UserID)
 				assert.Equal(t, tc.expectedWallet.Balance, wallet.Balance)
 			}
+			
+			// Verify that all expected calls were made
+			mockRepo.AssertExpectations(t)
 		})
 	}
 }
 
 func TestExchange(t *testing.T) {
-	db, mock, service := setupTestDB(t)
-	defer db.Close()
+	mockRepo, service := setupTestService(t)
+	ctx := context.Background()
 
 	// Test case: successful exchange
 	t.Run("Successful Exchange", func(t *testing.T) {
@@ -117,38 +137,75 @@ func TestExchange(t *testing.T) {
 			Source:    "game_reward",
 		}
 
-		// Exchange rate setup
-		mock.ExpectQuery("SELECT to_platform_ratio FROM exchange_rates").
-			WithArgs(req.GameID, req.TokenType).
-			WillReturnRows(sqlmock.NewRows([]string{"to_platform_ratio"}).AddRow(2.5))
+		// Mock repository responses
+		exchangeRate := &model.ExchangeRate{
+			ID:              1,
+			GameID:          "game1",
+			TokenType:       "gold",
+			ToPlatformRatio: 2.5,
+			CreatedAt:       time.Now(),
+		}
+		
+		wallet := &model.Wallet{
+			ID:        1,
+			UserID:    123,
+			Balance:   200.0, // Current balance
+			CreatedAt: time.Now(),
+		}
+		
+		updatedWallet := &model.Wallet{
+			ID:        1,
+			UserID:    123,
+			Balance:   450.0, // Balance after exchange (200 + 100*2.5)
+			CreatedAt: time.Now(),
+		}
+		
+		mockTx := new(repository.MockTransaction)
+		
+		// Create expected wallet log
+		expectedLog := &model.WalletLog{
+			WalletID:       1,
+			UserID:         123,
+			GameID:         &req.GameID,
+			TokenType:      &req.TokenType,
+			Amount:         100,
+			PlatformAmount: 250.0, // 100 * 2.5
+			Source:         model.TransactionExchange,
+		}
+		
+		returnedLog := &model.WalletLog{
+			ID:             1,
+			WalletID:       1,
+			UserID:         123,
+			GameID:         &req.GameID,
+			TokenType:      &req.TokenType,
+			Amount:         100,
+			PlatformAmount: 250.0,
+			Source:         model.TransactionExchange,
+			CreatedAt:      time.Now(),
+		}
 
-		// Transaction begin
-		mock.ExpectBegin()
-
-		// Get/create wallet
-		mock.ExpectQuery("INSERT INTO wallets").
-			WithArgs(req.UserID).
-			WillReturnRows(sqlmock.NewRows([]string{"id", "balance"}).AddRow(1, 200.0))
-
-		// Update wallet balance
-		mock.ExpectExec("UPDATE wallets SET balance").
-			WithArgs(450.0, 1). // 200 (current) + 250 (100 * 2.5)
-			WillReturnResult(sqlmock.NewResult(1, 1))
-
-		// Log transaction
-		mock.ExpectExec("INSERT INTO wallet_logs").
-			WithArgs(1, req.UserID, req.GameID, req.TokenType, req.Amount, 250.0, req.Source).
-			WillReturnResult(sqlmock.NewResult(1, 1))
-
-		// Transaction commit
-		mock.ExpectCommit()
+		// Set up expectations
+		mockRepo.On("GetExchangeRate", mock.Anything, req.GameID, req.TokenType).Return(exchangeRate, nil).Once()
+		mockRepo.On("BeginTx", mock.Anything).Return(mockTx, nil).Once()
+		mockRepo.On("GetWalletByUserIDForUpdate", mock.Anything, req.UserID, mockTx).Return(wallet, nil).Once()
+		mockRepo.On("UpdateWalletBalance", mock.Anything, req.UserID, 450.0, mockTx).Return(updatedWallet, nil).Once()
+		mockRepo.On("CreateWalletLog", mock.Anything, mock.MatchedBy(func(log *model.WalletLog) bool {
+			return log.UserID == expectedLog.UserID && 
+				   log.PlatformAmount == expectedLog.PlatformAmount
+		}), mockTx).Return(returnedLog, nil).Once()
+		mockTx.On("Commit").Return(nil).Once()
 
 		// Call the service method
-		platformAmount, err := service.Exchange(req)
+		platformAmount, err := service.Exchange(ctx, req)
 
 		// Check results
 		assert.NoError(t, err)
 		assert.Equal(t, 250.0, platformAmount)
+		
+		// Verify that all expected calls were made
+		mockRepo.AssertExpectations(t)
+		mockTx.AssertExpectations(t)
 	})
 
 	// Test case: exchange rate not found
@@ -161,15 +218,15 @@ func TestExchange(t *testing.T) {
 			Source:    "game_reward",
 		}
 
-		mock.ExpectQuery("SELECT to_platform_ratio FROM exchange_rates").
-			WithArgs(req.GameID, req.TokenType).
-			WillReturnError(sql.ErrNoRows)
+		mockRepo.On("GetExchangeRate", mock.Anything, req.GameID, req.TokenType).Return(nil, nil).Once()
 
-		platformAmount, err := service.Exchange(req)
+		platformAmount, err := service.Exchange(ctx, req)
 
 		assert.Error(t, err)
 		assert.Contains(t, err.Error(), "exchange rate not found")
 		assert.Equal(t, 0.0, platformAmount)
+		
+		mockRepo.AssertExpectations(t)
 	})
 
 	// Test case: database error
@@ -182,14 +239,14 @@ func TestExchange(t *testing.T) {
 			Source:    "game_reward",
 		}
 
-		mock.ExpectQuery("SELECT to_platform_ratio FROM exchange_rates").
-			WithArgs(req.GameID, req.TokenType).
-			WillReturnError(fmt.Errorf("database error"))
+		mockRepo.On("GetExchangeRate", mock.Anything, req.GameID, req.TokenType).Return(nil, fmt.Errorf("database error")).Once()
 
-		platformAmount, err := service.Exchange(req)
+		platformAmount, err := service.Exchange(ctx, req)
 
 		assert.Error(t, err)
 		assert.Equal(t, 0.0, platformAmount)
+		
+		mockRepo.AssertExpectations(t)
 	})
 
 	// Test case: transaction error
@@ -202,28 +259,34 @@ func TestExchange(t *testing.T) {
 			Source:    "game_reward",
 		}
 
-		mock.ExpectQuery("SELECT to_platform_ratio FROM exchange_rates").
-			WithArgs(req.GameID, req.TokenType).
-			WillReturnRows(sqlmock.NewRows([]string{"to_platform_ratio"}).AddRow(2.5))
+		exchangeRate := &model.ExchangeRate{
+			ID:              1,
+			GameID:          "game1",
+			TokenType:       "gold",
+			ToPlatformRatio: 2.5,
+			CreatedAt:       time.Now(),
+		}
+		
+		mockTx := new(repository.MockTransaction)
 
-		mock.ExpectBegin()
+		mockRepo.On("GetExchangeRate", mock.Anything, req.GameID, req.TokenType).Return(exchangeRate, nil).Once()
+		mockRepo.On("BeginTx", mock.Anything).Return(mockTx, nil).Once()
+		mockRepo.On("GetWalletByUserIDForUpdate", mock.Anything, req.UserID, mockTx).Return(nil, fmt.Errorf("database error")).Once()
+		mockTx.On("Rollback").Return(nil).Once()
 
-		mock.ExpectQuery("INSERT INTO wallets").
-			WithArgs(req.UserID).
-			WillReturnError(fmt.Errorf("database error"))
-
-		mock.ExpectRollback()
-
-		platformAmount, err := service.Exchange(req)
+		platformAmount, err := service.Exchange(ctx, req)
 
 		assert.Error(t, err)
 		assert.Equal(t, 0.0, platformAmount)
+		
+		mockRepo.AssertExpectations(t)
+		mockTx.AssertExpectations(t)
 	})
 }
 
 func TestSpend(t *testing.T) {
-	db, mock, service := setupTestDB(t)
-	defer db.Close()
+	mockRepo, service := setupTestService(t)
+	ctx := context.Background()
 
 	// Test case: successful spend
 	t.Run("Successful Spend", func(t *testing.T) {
@@ -234,33 +297,64 @@ func TestSpend(t *testing.T) {
 			ReferenceID: "ORDER-123",
 		}
 
-		// Transaction begin
-		mock.ExpectBegin()
+		wallet := &model.Wallet{
+			ID:        1,
+			UserID:    123,
+			Balance:   200.0, // Current balance
+			CreatedAt: time.Now(),
+		}
+		
+		updatedWallet := &model.Wallet{
+			ID:        1,
+			UserID:    123,
+			Balance:   150.0, // Balance after spend (200 - 50)
+			CreatedAt: time.Now(),
+		}
+		
+		mockTx := new(repository.MockTransaction)
+		
+		// Create expected wallet log
+		expectedLog := &model.WalletLog{
+			WalletID:       1,
+			UserID:         123,
+			Amount:         -req.Amount,
+			PlatformAmount: -req.Amount,
+			Source:         req.Reason,
+			ReferenceID:    &req.ReferenceID,
+		}
+		
+		returnedLog := &model.WalletLog{
+			ID:             1,
+			WalletID:       1,
+			UserID:         123,
+			Amount:         -req.Amount,
+			PlatformAmount: -req.Amount,
+			Source:         req.Reason,
+			ReferenceID:    &req.ReferenceID,
+			CreatedAt:      time.Now(),
+		}
 
-		// Get wallet with lock
-		mock.ExpectQuery("SELECT id, balance FROM wallets WHERE user_id = (.+) FOR UPDATE").
-			WithArgs(req.UserID).
-			WillReturnRows(sqlmock.NewRows([]string{"id", "balance"}).AddRow(1, 200.0))
-
-		// Update wallet balance
-		mock.ExpectExec("UPDATE wallets SET balance = (.+) WHERE id = (.+)").
-			WithArgs(150.0, 1). // 200 (current) - 50
-			WillReturnResult(sqlmock.NewResult(1, 1))
-
-		// Log transaction
-		mock.ExpectExec("INSERT INTO wallet_logs").
-			WithArgs(1, req.UserID, -req.Amount, -req.Amount, req.Reason, req.ReferenceID).
-			WillReturnResult(sqlmock.NewResult(1, 1))
-
-		// Transaction commit
-		mock.ExpectCommit()
+		// Set up expectations
+		mockRepo.On("BeginTx", mock.Anything).Return(mockTx, nil).Once()
+		mockRepo.On("GetWalletByUserIDForUpdate", mock.Anything, req.UserID, mockTx).Return(wallet, nil).Once()
+		mockRepo.On("SpendFromWallet", mock.Anything, req.UserID, req.Amount, mockTx).Return(updatedWallet, nil).Once()
+		mockRepo.On("CreateWalletLog", mock.Anything, mock.MatchedBy(func(log *model.WalletLog) bool {
+			return log.UserID == expectedLog.UserID && 
+				   log.PlatformAmount == expectedLog.PlatformAmount &&
+				   log.Source == expectedLog.Source
+		}), mockTx).Return(returnedLog, nil).Once()
+		mockTx.On("Commit").Return(nil).Once()
 
 		// Call the service method
-		newBalance, err := service.Spend(req)
+		newBalance, err := service.Spend(ctx, req)
 
 		// Check results
 		assert.NoError(t, err)
 		assert.Equal(t, 150.0, newBalance)
+		
+		// Verify that all expected calls were made
+		mockRepo.AssertExpectations(t)
+		mockTx.AssertExpectations(t)
 	})
 
 	// Test case: wallet not found
@@ -272,19 +366,20 @@ func TestSpend(t *testing.T) {
 			ReferenceID: "ORDER-456",
 		}
 
-		mock.ExpectBegin()
+		mockTx := new(repository.MockTransaction)
 
-		mock.ExpectQuery("SELECT id, balance FROM wallets WHERE user_id = (.+) FOR UPDATE").
-			WithArgs(req.UserID).
-			WillReturnError(sql.ErrNoRows)
+		mockRepo.On("BeginTx", mock.Anything).Return(mockTx, nil).Once()
+		mockRepo.On("GetWalletByUserIDForUpdate", mock.Anything, req.UserID, mockTx).Return(nil, nil).Once()
+		mockTx.On("Rollback").Return(nil).Once()
 
-		mock.ExpectRollback()
-
-		newBalance, err := service.Spend(req)
+		newBalance, err := service.Spend(ctx, req)
 
 		assert.Error(t, err)
 		assert.Contains(t, err.Error(), "wallet not found")
 		assert.Equal(t, 0.0, newBalance)
+		
+		mockRepo.AssertExpectations(t)
+		mockTx.AssertExpectations(t)
 	})
 
 	// Test case: insufficient funds
@@ -296,19 +391,27 @@ func TestSpend(t *testing.T) {
 			ReferenceID: "ORDER-789",
 		}
 
-		mock.ExpectBegin()
+		wallet := &model.Wallet{
+			ID:        2,
+			UserID:    789,
+			Balance:   100.0, // Not enough balance for 300.0 spend
+			CreatedAt: time.Now(),
+		}
+		
+		mockTx := new(repository.MockTransaction)
 
-		mock.ExpectQuery("SELECT id, balance FROM wallets WHERE user_id = (.+) FOR UPDATE").
-			WithArgs(req.UserID).
-			WillReturnRows(sqlmock.NewRows([]string{"id", "balance"}).AddRow(2, 100.0))
+		mockRepo.On("BeginTx", mock.Anything).Return(mockTx, nil).Once()
+		mockRepo.On("GetWalletByUserIDForUpdate", mock.Anything, req.UserID, mockTx).Return(wallet, nil).Once()
+		mockTx.On("Rollback").Return(nil).Once()
 
-		mock.ExpectRollback()
-
-		newBalance, err := service.Spend(req)
+		newBalance, err := service.Spend(ctx, req)
 
 		assert.Error(t, err)
 		assert.Contains(t, err.Error(), "insufficient funds")
 		assert.Equal(t, 0.0, newBalance)
+		
+		mockRepo.AssertExpectations(t)
+		mockTx.AssertExpectations(t)
 	})
 
 	// Test case: database error
@@ -320,44 +423,69 @@ func TestSpend(t *testing.T) {
 			ReferenceID: "ORDER-123",
 		}
 
-		mock.ExpectBegin()
+		mockTx := new(repository.MockTransaction)
 
-		mock.ExpectQuery("SELECT id, balance FROM wallets WHERE user_id = (.+) FOR UPDATE").
-			WithArgs(req.UserID).
-			WillReturnError(fmt.Errorf("database error"))
+		mockRepo.On("BeginTx", mock.Anything).Return(mockTx, nil).Once()
+		mockRepo.On("GetWalletByUserIDForUpdate", mock.Anything, req.UserID, mockTx).Return(nil, fmt.Errorf("database error")).Once()
+		mockTx.On("Rollback").Return(nil).Once()
 
-		mock.ExpectRollback()
-
-		newBalance, err := service.Spend(req)
+		newBalance, err := service.Spend(ctx, req)
 
 		assert.Error(t, err)
 		assert.Equal(t, 0.0, newBalance)
+		
+		mockRepo.AssertExpectations(t)
+		mockTx.AssertExpectations(t)
 	})
 }
 
 func TestGetWalletLogs(t *testing.T) {
-	db, mock, service := setupTestDB(t)
-	defer db.Close()
+	mockRepo, service := setupTestService(t)
+	ctx := context.Background()
 
 	// Test case: successful retrieval of logs
 	t.Run("Successful Logs Retrieval", func(t *testing.T) {
 		userID := 123
+		
+		// Create test date
+		now := time.Now()
+		
+		// Create mock wallet logs
+		gameID := "game1"
+		tokenType := "gold"
+		source := "won"
+		refID := "ORDER-123"
+		mockLogs := []*model.WalletLog{
+			{
+				ID:             1,
+				WalletID:       1,
+				UserID:         userID,
+				GameID:         &gameID,
+				TokenType:      &tokenType,
+				Source:         source,
+				Amount:         100.0,
+				PlatformAmount: 250.0,
+				CreatedAt:      now,
+			},
+			{
+				ID:             2,
+				WalletID:       1,
+				UserID:         userID,
+				GameID:         nil,
+				TokenType:      nil,
+				Source:         "market_purchase",
+				Amount:         -50.0,
+				PlatformAmount: -50.0,
+				ReferenceID:    &refID,
+				CreatedAt:      now,
+			},
+		}
 
-		// Create mock rows
-		rows := sqlmock.NewRows([]string{
-			"game_id", "token_type", "source",
-			"original_amount", "converted_amount",
-			"operation", "reference_id", "created_at",
-		}).
-			AddRow("game1", "gold", "won", 100.0, 250.0, "exchange", nil, time.Now()).
-			AddRow(nil, nil, "market_purchase", 50.0, -50.0, "spend", "ORDER-123", time.Now())
-
-		mock.ExpectQuery("SELECT (.+) FROM wallet_logs").
-			WithArgs(userID).
-			WillReturnRows(rows)
+		// Set up expectation for default limits
+		mockRepo.On("GetWalletLogs", mock.Anything, userID, 50, 0).Return(mockLogs, nil).Once()
 
 		// Call the service method
-		logs, err := service.GetWalletLogs(userID)
+		logs, err := service.GetWalletLogs(ctx, userID)
 
 		// Check results
 		assert.NoError(t, err)
@@ -369,50 +497,49 @@ func TestGetWalletLogs(t *testing.T) {
 		assert.Equal(t, "won", *logs[0].Source)
 		assert.Equal(t, 100.0, logs[0].OriginalAmount)
 		assert.Equal(t, 250.0, logs[0].ConvertedAmount)
-		assert.Equal(t, "exchange", logs[0].Operation)
+		assert.Equal(t, model.TransactionExchange, logs[0].Operation)
 		assert.Nil(t, logs[0].ReferenceID)
 
 		// Check second log (spend)
 		assert.Nil(t, logs[1].GameID)
 		assert.Nil(t, logs[1].TokenType)
 		assert.Equal(t, "market_purchase", *logs[1].Source)
-		assert.Equal(t, 50.0, logs[1].OriginalAmount)
+		assert.Equal(t, -50.0, logs[1].OriginalAmount)
 		assert.Equal(t, -50.0, logs[1].ConvertedAmount)
-		assert.Equal(t, "spend", logs[1].Operation)
+		assert.Equal(t, model.TransactionSpend, logs[1].Operation)
 		assert.Equal(t, "ORDER-123", *logs[1].ReferenceID)
+		
+		mockRepo.AssertExpectations(t)
 	})
 
 	// Test case: empty logs
 	t.Run("No Logs Found", func(t *testing.T) {
 		userID := 456
+		
+		// Empty logs list
+		var emptyLogs []*model.WalletLog
+		
+		mockRepo.On("GetWalletLogs", mock.Anything, userID, 50, 0).Return(emptyLogs, nil).Once()
 
-		rows := sqlmock.NewRows([]string{
-			"game_id", "token_type", "source",
-			"original_amount", "converted_amount",
-			"operation", "reference_id", "created_at",
-		})
-
-		mock.ExpectQuery("SELECT (.+) FROM wallet_logs").
-			WithArgs(userID).
-			WillReturnRows(rows)
-
-		logs, err := service.GetWalletLogs(userID)
+		logs, err := service.GetWalletLogs(ctx, userID)
 
 		assert.NoError(t, err)
 		assert.Empty(t, logs)
+		
+		mockRepo.AssertExpectations(t)
 	})
 
 	// Test case: database error
 	t.Run("Database Error", func(t *testing.T) {
 		userID := 789
 
-		mock.ExpectQuery("SELECT (.+) FROM wallet_logs").
-			WithArgs(userID).
-			WillReturnError(fmt.Errorf("database error"))
+		mockRepo.On("GetWalletLogs", mock.Anything, userID, 50, 0).Return(nil, fmt.Errorf("database error")).Once()
 
-		logs, err := service.GetWalletLogs(userID)
+		logs, err := service.GetWalletLogs(ctx, userID)
 
 		assert.Error(t, err)
 		assert.Nil(t, logs)
+		
+		mockRepo.AssertExpectations(t)
 	})
 }

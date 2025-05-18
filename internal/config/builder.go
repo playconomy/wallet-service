@@ -11,9 +11,10 @@ import (
 )
 
 type Config struct {
-	Server   ServerConfig   `validate:"required"`
-	Database DatabaseConfig `validate:"required"`
-	App      AppConfig      `validate:"required"`
+	Server        ServerConfig        `validate:"required"`
+	Database      DatabaseConfig      `validate:"required"`
+	App           AppConfig           `validate:"required"`
+	Observability ObservabilityConfig `validate:"required"`
 }
 
 type ServerConfig struct {
@@ -34,6 +35,22 @@ type AppConfig struct {
 	Name     string `validate:"required"`
 	Env      string `validate:"required,oneof=development staging production"`
 	LogLevel string `validate:"required,oneof=debug info warn error"`
+	Version  string `validate:"required"`
+}
+
+type ObservabilityConfig struct {
+	Tracing TracingConfig `validate:"required"`
+	Metrics MetricsConfig `validate:"required"`
+}
+
+type TracingConfig struct {
+	Enabled        bool    `validate:"required"`
+	Endpoint       string  `validate:"required_if=Enabled true"`
+	SamplingRatio  float64 `validate:"required,gte=0,lte=1"`
+}
+
+type MetricsConfig struct {
+	Enabled bool `validate:"required"`
 }
 
 // LoadConfig loads configuration from environment file and environment variables
@@ -76,6 +93,18 @@ func LoadConfig() (*Config, error) {
 		Name:     viper.GetString("APP_NAME"),
 		Env:      viper.GetString("APP_ENV"),
 		LogLevel: viper.GetString("LOG_LEVEL"),
+		Version:  viper.GetString("APP_VERSION"),
+	}
+
+	config.Observability = ObservabilityConfig{
+		Tracing: TracingConfig{
+			Enabled:       viper.GetBool("TRACING_ENABLED"),
+			Endpoint:      viper.GetString("TRACING_ENDPOINT"),
+			SamplingRatio: viper.GetFloat64("TRACING_SAMPLING_RATIO"),
+		},
+		Metrics: MetricsConfig{
+			Enabled: viper.GetBool("METRICS_ENABLED"),
+		},
 	}
 
 	// Validate config
@@ -103,6 +132,13 @@ func setDefaults() {
 	viper.SetDefault("APP_NAME", "wallet-service")
 	viper.SetDefault("APP_ENV", "development")
 	viper.SetDefault("LOG_LEVEL", "info")
+	viper.SetDefault("APP_VERSION", "0.1.0")
+	
+	// Observability defaults
+	viper.SetDefault("TRACING_ENABLED", false)
+	viper.SetDefault("TRACING_ENDPOINT", "localhost:4317")
+	viper.SetDefault("TRACING_SAMPLING_RATIO", 0.1)
+	viper.SetDefault("METRICS_ENABLED", true)
 }
 
 // GetDSN returns database connection string

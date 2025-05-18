@@ -10,6 +10,7 @@ A microservice for managing platform tokens (wallet system) built with Go and Fi
 - Track wallet transaction history
 - Authentication and authorization
 - Swagger API documentation
+- Structured logging and observability
 
 ## Tech Stack
 
@@ -20,6 +21,9 @@ A microservice for managing platform tokens (wallet system) built with Go and Fi
 - **go-validator**: Request validation
 - **Swagger**: API documentation
 - **golang-migrate**: Database migrations
+- **zap**: Structured logging
+- **Prometheus**: Metrics collection
+- **OpenTelemetry**: Distributed tracing
 
 ## Getting Started
 
@@ -28,6 +32,8 @@ A microservice for managing platform tokens (wallet system) built with Go and Fi
 - Go 1.21+
 - PostgreSQL 15+
 - Docker (optional)
+- Prometheus (optional, for metrics)
+- Jaeger/OpenTelemetry Collector (optional, for tracing)
 
 ### Installation
 

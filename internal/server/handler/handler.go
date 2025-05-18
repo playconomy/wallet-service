@@ -4,26 +4,37 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/playconomy/wallet-service/internal/observability"
 	"github.com/playconomy/wallet-service/internal/server/dto"
 	"github.com/playconomy/wallet-service/internal/service"
 	"github.com/playconomy/wallet-service/internal/utils"
 
 	"github.com/gofiber/fiber/v2"
 	"go.uber.org/fx"
+	"go.uber.org/zap"
 )
 
 // Module provides handler dependencies
 var Module = fx.Options(
 	fx.Provide(NewWalletHandler),
+	// Provide interface implementation for dependency injection
+	fx.Provide(func(h *WalletHandler) WalletHandlerInterface { return h }),
 )
 
 type WalletHandler struct {
-	walletService *service.WalletService
+	walletService service.WalletServiceInterface
+	logger        *zap.Logger
+	metrics       *observability.Metrics
 }
 
-func NewWalletHandler(walletService *service.WalletService) *WalletHandler {
+// Compile-time verification that WalletHandler implements WalletHandlerInterface
+var _ WalletHandlerInterface = (*WalletHandler)(nil)
+
+func NewWalletHandler(walletService service.WalletServiceInterface, obs *observability.Observability) *WalletHandler {
 	return &WalletHandler{
 		walletService: walletService,
+		logger:        obs.Logger.With(zap.String("component", "wallet_handler")),
+		metrics:       obs.Metrics,
 	}
 }
 
@@ -46,12 +57,22 @@ func NewWalletHandler(walletService *service.WalletService) *WalletHandler {
 //	@Security		ApiRoleAuth
 //	@Router			/{user_id} [get]
 func (h *WalletHandler) GetWallet(c *fiber.Ctx) error {
+	requestID := c.Locals("requestid").(string)
+	logger := h.logger.With(zap.String("request_id", requestID))
+	
+	// Create a context for tracing
+	ctx := c.Context()
+	
 	// Get authenticated user ID from context
 	authenticatedUserID := c.Locals("user_id").(int)
+	logger.Debug("Processing wallet request", 
+		zap.Int("authenticated_user_id", authenticatedUserID))
 
 	// Get requested user ID from path parameter
 	userID, err := strconv.Atoi(c.Params("user_id"))
 	if err != nil {
+		logger.Warn("Invalid user ID format", 
+			zap.String("user_id_param", c.Params("user_id")))
 		return c.Status(fiber.StatusBadRequest).JSON(dto.WalletResponse{
 			Success: false,
 			Error:   "Invalid user ID format",
@@ -60,6 +81,9 @@ func (h *WalletHandler) GetWallet(c *fiber.Ctx) error {
 
 	// Validate user ID
 	if err := utils.ValidateStruct(&dto.Wallet{UserID: userID}); err != nil {
+		logger.Warn("Invalid user ID", 
+			zap.Int("user_id", userID),
+			zap.Error(err))
 		return c.Status(fiber.StatusBadRequest).JSON(dto.WalletResponse{
 			Success: false,
 			Error:   err.Error(),
@@ -70,14 +94,27 @@ func (h *WalletHandler) GetWallet(c *fiber.Ctx) error {
 	// Unless they have admin role
 	userRole := c.Locals("user_role").(string)
 	if authenticatedUserID != userID && userRole != "admin" {
+		logger.Warn("Unauthorized wallet access attempt", 
+			zap.Int("authenticated_user_id", authenticatedUserID),
+			zap.Int("requested_user_id", userID),
+			zap.String("role", userRole))
+		h.metrics.RecordWalletOperation("view", "forbidden")
 		return c.Status(fiber.StatusForbidden).JSON(dto.WalletResponse{
 			Success: false,
 			Error:   "You can only access your own wallet",
 		})
 	}
 
-	wallet, err := h.walletService.GetWalletByUserID(userID)
+	logger.Debug("Authorization passed", 
+		zap.Int("user_id", userID),
+		zap.String("role", userRole))
+
+	wallet, err := h.walletService.GetWalletByUserID(ctx, userID)
 	if err != nil {
+		logger.Error("Error getting wallet", 
+			zap.Int("user_id", userID),
+			zap.Error(err))
+		h.metrics.RecordWalletOperation("view", "error")
 		return c.Status(fiber.StatusInternalServerError).JSON(dto.WalletResponse{
 			Success: false,
 			Error:   "Internal server error",
@@ -85,12 +122,19 @@ func (h *WalletHandler) GetWallet(c *fiber.Ctx) error {
 	}
 
 	if wallet == nil {
+		logger.Info("Wallet not found", zap.Int("user_id", userID))
+		h.metrics.RecordWalletOperation("view", "not_found")
 		return c.Status(fiber.StatusNotFound).JSON(dto.WalletResponse{
 			Success: false,
 			Error:   "Wallet not found",
 		})
 	}
 
+	logger.Info("Retrieved wallet successfully", 
+		zap.Int("user_id", userID),
+		zap.Float64("balance", wallet.Balance))
+	h.metrics.RecordWalletOperation("view", "success")
+	
 	return c.JSON(dto.WalletResponse{
 		Success: true,
 		Data:    wallet,
@@ -115,19 +159,36 @@ func (h *WalletHandler) GetWallet(c *fiber.Ctx) error {
 //	@Security		ApiRoleAuth
 //	@Router			/exchange [post]
 func (h *WalletHandler) Exchange(c *fiber.Ctx) error {
+	requestID := c.Locals("requestid").(string)
+	logger := h.logger.With(zap.String("request_id", requestID))
+	
+	// Create a context for tracing
+	ctx := c.Context()
+	
 	// Get authenticated user ID from context
 	authenticatedUserID := c.Locals("user_id").(int)
+	logger.Debug("Processing exchange request", 
+		zap.Int("authenticated_user_id", authenticatedUserID))
 
 	var req dto.ExchangeRequest
 	if err := c.BodyParser(&req); err != nil {
+		logger.Warn("Invalid request body", zap.Error(err))
+		h.metrics.RecordWalletOperation("exchange", "invalid_body")
 		return c.Status(fiber.StatusBadRequest).JSON(dto.ExchangeResponse{
 			Success: false,
 			Error:   "Invalid request body",
 		})
 	}
 
+	// Add authenticated user ID to the request
+	req.UserID = authenticatedUserID
+
 	// Validate request
 	if err := utils.ValidateStruct(&req); err != nil {
+		logger.Warn("Invalid exchange request", 
+			zap.Any("request", req),
+			zap.Error(err))
+		h.metrics.RecordWalletOperation("exchange", "validation_failed")
 		return c.Status(fiber.StatusBadRequest).JSON(dto.ExchangeResponse{
 			Success: false,
 			Error:   err.Error(),
@@ -138,27 +199,49 @@ func (h *WalletHandler) Exchange(c *fiber.Ctx) error {
 	// Unless they have admin role
 	userRole := c.Locals("user_role").(string)
 	if authenticatedUserID != req.UserID && userRole != "admin" {
+		logger.Warn("Unauthorized exchange attempt", 
+			zap.Int("authenticated_user_id", authenticatedUserID),
+			zap.Int("requested_user_id", req.UserID),
+			zap.String("role", userRole))
+		h.metrics.RecordWalletOperation("exchange", "forbidden")
 		return c.Status(fiber.StatusForbidden).JSON(dto.ExchangeResponse{
 			Success: false,
 			Error:   "You can only exchange to your own wallet",
 		})
 	}
 
-	newBalance, err := h.walletService.Exchange(&req)
+	logger.Info("Processing exchange", 
+		zap.Int("user_id", req.UserID),
+		zap.String("game_id", req.GameID),
+		zap.String("token_type", req.TokenType),
+		zap.Float64("amount", req.Amount))
+
+	newBalance, err := h.walletService.Exchange(ctx, &req)
 	if err != nil {
 		if strings.Contains(err.Error(), "exchange rate not found") {
+			logger.Error("Exchange rate not found", 
+				zap.String("game_id", req.GameID),
+				zap.String("token_type", req.TokenType))
 			return c.Status(fiber.StatusBadRequest).JSON(dto.ExchangeResponse{
 				Success: false,
 				Error:   err.Error(),
 			})
 		}
 
+		logger.Error("Exchange operation failed", 
+			zap.Int("user_id", req.UserID),
+			zap.Error(err))
 		return c.Status(fiber.StatusInternalServerError).JSON(dto.ExchangeResponse{
 			Success: false,
 			Error:   "Internal server error",
 		})
 	}
 
+	logger.Info("Exchange successful", 
+		zap.Int("user_id", req.UserID),
+		zap.Float64("new_balance", newBalance))
+	h.metrics.RecordWalletOperation("exchange", "success")
+	
 	return c.JSON(dto.ExchangeResponse{
 		Success:    true,
 		NewBalance: newBalance,

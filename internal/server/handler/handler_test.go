@@ -2,54 +2,71 @@ package handler
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"net/http/httptest"
 	"testing"
 
+	"github.com/playconomy/wallet-service/internal/observability"
 	"github.com/playconomy/wallet-service/internal/server/dto"
+	"github.com/playconomy/wallet-service/internal/service"
 
 	"github.com/gofiber/fiber/v2"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
+	"go.uber.org/zap"
 )
 
-// MockWalletService is a mock implementation of WalletService for testing
+// MockWalletService is a mock implementation of WalletServiceInterface for testing
 type MockWalletService struct {
 	mock.Mock
 }
 
-func (m *MockWalletService) GetWalletByUserID(userID int) (*dto.Wallet, error) {
-	args := m.Called(userID)
+func (m *MockWalletService) GetWalletByUserID(ctx context.Context, userID int) (*dto.Wallet, error) {
+	args := m.Called(ctx, userID)
 	if args.Get(0) == nil {
 		return nil, args.Error(1)
 	}
 	return args.Get(0).(*dto.Wallet), args.Error(1)
 }
 
-func (m *MockWalletService) Exchange(req *dto.ExchangeRequest) (float64, error) {
-	args := m.Called(req)
+func (m *MockWalletService) Exchange(ctx context.Context, req *dto.ExchangeRequest) (float64, error) {
+	args := m.Called(ctx, req)
 	return args.Get(0).(float64), args.Error(1)
 }
 
-func (m *MockWalletService) Spend(req *dto.SpendRequest) (float64, error) {
-	args := m.Called(req)
+func (m *MockWalletService) Spend(ctx context.Context, req *dto.SpendRequest) (float64, error) {
+	args := m.Called(ctx, req)
 	return args.Get(0).(float64), args.Error(1)
 }
 
-func (m *MockWalletService) GetWalletLogs(userID int) ([]dto.WalletLogEntry, error) {
-	args := m.Called(userID)
+func (m *MockWalletService) GetWalletLogs(ctx context.Context, userID int) ([]dto.WalletLogEntry, error) {
+	args := m.Called(ctx, userID)
 	if args.Get(0) == nil {
 		return nil, args.Error(1)
 	}
 	return args.Get(0).([]dto.WalletLogEntry), args.Error(1)
 }
 
+// Compile-time verification that MockWalletService implements WalletServiceInterface
+var _ service.WalletServiceInterface = (*MockWalletService)(nil)
+
 // Setup test app with mocked service
-func setupTestApp(t *testing.T) (*fiber.App, *MockWalletService) {
+func setupTestApp(t *testing.T) (*fiber.App, *MockWalletService, WalletHandlerInterface) {
 	app := fiber.New()
 	mockService := new(MockWalletService)
-	handler := &WalletHandler{walletService: mockService}
+	
+	// Create test logger
+	logger, _ := zap.NewDevelopment()
+	
+	// Create observability
+	obs := &observability.Observability{
+		Logger: &observability.Logger{Logger: logger},
+	}
+	
+	// Create handler interface
+	handler := NewWalletHandler(mockService, obs)
 
 	// Setup routes
 	app.Get("/:user_id", handler.GetWallet)
@@ -57,11 +74,14 @@ func setupTestApp(t *testing.T) (*fiber.App, *MockWalletService) {
 	app.Post("/spend", handler.Spend)
 	app.Get("/:user_id/logs", handler.GetWalletLogs)
 
+	return app, mockService, handler
+}
+
 	return app, mockService
 }
 
 func TestGetWallet(t *testing.T) {
-	app, mockService := setupTestApp(t)
+	app, mockService, _ := setupTestApp(t)
 
 	t.Run("Success", func(t *testing.T) {
 		// Setup
@@ -70,7 +90,7 @@ func TestGetWallet(t *testing.T) {
 			UserID:  123,
 			Balance: 100.0,
 		}
-		mockService.On("GetWalletByUserID", 123).Return(wallet, nil).Once()
+		mockService.On("GetWalletByUserID", mock.Anything, 123).Return(wallet, nil).Once()
 
 		// Create request
 		req := httptest.NewRequest("GET", "/123", nil)
@@ -78,6 +98,7 @@ func TestGetWallet(t *testing.T) {
 
 		// Set auth context values that would be set by middleware
 		ctx := fiber.New().AcquireCtx(req)
+		ctx.Locals("requestid", "test-request-id")
 		ctx.Locals("user_id", 123)
 		ctx.Locals("user_role", "user")
 		ctx.Params().Set("user_id", "123")
@@ -99,6 +120,10 @@ func TestGetWallet(t *testing.T) {
 		assert.Equal(t, wallet.ID, response.Data.ID)
 		assert.Equal(t, wallet.UserID, response.Data.UserID)
 		assert.Equal(t, wallet.Balance, response.Data.Balance)
+		
+		// Verify that all expected calls were made
+		mockService.AssertExpectations(t)
+	})
 	})
 
 	t.Run("Not Found", func(t *testing.T) {

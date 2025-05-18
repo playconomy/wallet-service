@@ -1,6 +1,8 @@
+// Package integration provides integration test utilities and tests for the wallet service
 package integration
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"log"
@@ -9,9 +11,12 @@ import (
 	"time"
 
 	_ "github.com/lib/pq"
-
 	"github.com/ory/dockertest/v3"
 	"github.com/ory/dockertest/v3/docker"
+	"github.com/playconomy/wallet-service/internal/observability"
+	"github.com/playconomy/wallet-service/internal/repository"
+	"github.com/stretchr/testify/require"
+	"go.uber.org/zap"
 )
 
 var (
@@ -154,6 +159,15 @@ func runMigrations() error {
 // GetTestDB returns the test database instance for integration tests
 func GetTestDB() *sql.DB {
 	return db
+}
+
+// GetTestRepository returns a real postgres repository for integration tests
+func GetTestRepository(t *testing.T) repository.WalletRepository {
+	// Create observability for test
+	obs := observability.NewTestObservability()
+	
+	// Create repository with test DB
+	return repository.NewPostgresRepository(db, obs)
 }
 
 // ClearTestData deletes all test data between tests while preserving table structure

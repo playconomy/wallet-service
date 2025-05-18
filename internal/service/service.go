@@ -1,214 +1,375 @@
 package service
 
 import (
-	"database/sql"
+	"context"
 	"fmt"
 
+	"github.com/playconomy/wallet-service/internal/model"
+	"github.com/playconomy/wallet-service/internal/observability"
+	"github.com/playconomy/wallet-service/internal/observability/metrics"
+	"github.com/playconomy/wallet-service/internal/observability/tracing"
+	"github.com/playconomy/wallet-service/internal/repository"
 	"github.com/playconomy/wallet-service/internal/server/dto"
 	
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 	"go.uber.org/fx"
+	"go.uber.org/zap"
 )
 
 // Module provides service dependencies
 var Module = fx.Options(
 	fx.Provide(NewWalletService),
+	// Provide interface implementation for dependency injection
+	fx.Provide(func(s *WalletService) WalletServiceInterface { return s }),
 )
 
 type WalletService struct {
-	db *sql.DB
+	repo    repository.WalletRepository
+	logger  *zap.Logger
+	metrics *metrics.Metrics
+	tracer  *tracing.Tracer
 }
+
+// Compile-time verification that WalletService implements WalletServiceInterface
+var _ WalletServiceInterface = (*WalletService)(nil)
 
 // Constructors for fx dependency injection
-func NewWalletService(db *sql.DB) *WalletService {
-	return &WalletService{db: db}
+func NewWalletService(repo repository.WalletRepository, obs *observability.Observability) *WalletService {
+	return &WalletService{
+		repo:    repo,
+		logger:  obs.Logger.Logger,
+		metrics: obs.Metrics,
+		tracer:  obs.Tracer,
+	}
 }
 
-func (s *WalletService) GetWalletByUserID(userID int) (*dto.Wallet, error) {
-	wallet := &dto.Wallet{}
+func (s *WalletService) GetWalletByUserID(ctx context.Context, userID int) (*dto.Wallet, error) {
+	ctx, span := s.tracer.StartSpan(ctx, "WalletService.GetWalletByUserID",
+		trace.WithAttributes(attribute.Int("user_id", userID)))
+	defer span.End()
 
-	err := s.db.QueryRow(
-		"SELECT id, user_id, balance, created_at FROM wallets WHERE user_id = $1",
-		userID,
-	).Scan(&wallet.ID, &wallet.UserID, &wallet.Balance, &wallet.CreatedAt)
-
-	if err == sql.ErrNoRows {
-		return nil, nil
-	}
+	s.logger.Info("Getting wallet for user", zap.Int("user_id", userID))
+	
+	// Get wallet from repository
+	wallet, err := s.repo.GetWalletByUserID(ctx, userID)
+	
 	if err != nil {
+		s.logger.Error("Error retrieving wallet", 
+			zap.Int("user_id", userID),
+			zap.Error(err))
 		return nil, err
 	}
 
-	return wallet, nil
+	if wallet == nil {
+		s.logger.Info("Wallet not found for user", zap.Int("user_id", userID))
+		return nil, nil
+	}
+
+	s.logger.Debug("Retrieved wallet successfully", 
+		zap.Int("user_id", userID),
+		zap.Float64("balance", wallet.Balance))
+
+	// Convert model to DTO
+	return &dto.Wallet{
+		ID:        int(wallet.ID),
+		UserID:    wallet.UserID,
+		Balance:   wallet.Balance,
+		CreatedAt: wallet.CreatedAt,
+	}, nil
 }
 
-func (s *WalletService) Exchange(req *dto.ExchangeRequest) (float64, error) {
-	// Get exchange rate
-	var ratio float64
-	err := s.db.QueryRow(
-		"SELECT to_platform_ratio FROM exchange_rates WHERE game_id = $1 AND token_type = $2",
-		req.GameID, req.TokenType,
-	).Scan(&ratio)
+func (s *WalletService) Exchange(ctx context.Context, req *dto.ExchangeRequest) (float64, error) {
+	ctx, span := s.tracer.StartSpan(ctx, "WalletService.Exchange", 
+		trace.WithAttributes(
+			attribute.String("game_id", req.GameID),
+			attribute.String("token_type", req.TokenType),
+			attribute.Float64("amount", req.Amount),
+			attribute.Int("user_id", req.UserID),
+		))
+	defer span.End()
 
-	if err == sql.ErrNoRows {
-		return 0, fmt.Errorf("exchange rate not found for game_id=%s and token_type=%s", req.GameID, req.TokenType)
-	}
+	s.logger.Info("Processing exchange request", 
+		zap.String("game_id", req.GameID),
+		zap.String("token_type", req.TokenType),
+		zap.Float64("amount", req.Amount),
+		zap.Int("user_id", req.UserID))
+
+	// Get exchange rate
+	exchangeRate, err := s.repo.GetExchangeRate(ctx, req.GameID, req.TokenType)
 	if err != nil {
+		s.logger.Error("Error retrieving exchange rate", 
+			zap.String("game_id", req.GameID),
+			zap.String("token_type", req.TokenType),
+			zap.Error(err))
+		s.metrics.RecordWalletOperation("exchange", "error_db")
 		return 0, err
 	}
 
-	// Calculate platform amount
-	platformAmount := req.Amount * ratio
+	if exchangeRate == nil {
+		s.logger.Error("Exchange rate not found", 
+			zap.String("game_id", req.GameID),
+			zap.String("token_type", req.TokenType))
+		s.metrics.RecordWalletOperation("exchange", "error_rate_not_found")
+		return 0, fmt.Errorf("exchange rate not found for game_id=%s and token_type=%s", req.GameID, req.TokenType)
+	}
 
-	// Begin transaction
-	tx, err := s.db.Begin()
+	// Calculate platform amount
+	platformAmount := req.Amount * exchangeRate.ToPlatformRatio
+	s.logger.Debug("Calculated platform amount", 
+		zap.Float64("game_amount", req.Amount),
+		zap.Float64("exchange_rate", exchangeRate.ToPlatformRatio),
+		zap.Float64("platform_amount", platformAmount))
+
+	// Start a transaction
+	tx, err := s.repo.BeginTx(ctx)
 	if err != nil {
+		s.logger.Error("Failed to begin transaction", zap.Error(err))
+		s.metrics.RecordWalletOperation("exchange", "error_transaction")
 		return 0, err
 	}
 	defer tx.Rollback()
 
-	// Get or create wallet
-	var walletID int
-	var currentBalance float64
-	err = tx.QueryRow(
-		"INSERT INTO wallets (user_id, balance) VALUES ($1, 0) "+
-			"ON CONFLICT (user_id) DO UPDATE SET user_id = EXCLUDED.user_id "+
-			"RETURNING id, balance",
-		req.UserID,
-	).Scan(&walletID, &currentBalance)
+	// Try to get the wallet
+	wallet, err := s.repo.GetWalletByUserIDForUpdate(ctx, req.UserID, tx)
 	if err != nil {
+		s.logger.Error("Error getting wallet for update", 
+			zap.Int("user_id", req.UserID),
+			zap.Error(err))
+		s.metrics.RecordWalletOperation("exchange", "error_wallet")
 		return 0, err
 	}
 
-	// Update wallet balance
-	newBalance := currentBalance + platformAmount
-	_, err = tx.Exec(
-		"UPDATE wallets SET balance = $1 WHERE id = $2",
-		newBalance, walletID,
-	)
+	var newWallet *model.Wallet
+	
+	// If wallet doesn't exist, create a new one
+	if wallet == nil {
+		s.logger.Info("Creating new wallet for user", 
+			zap.Int("user_id", req.UserID),
+			zap.Float64("initial_balance", platformAmount))
+			
+		newWallet, err = s.repo.CreateWallet(ctx, req.UserID, platformAmount, tx)
+		if err != nil {
+			s.logger.Error("Failed to create wallet", 
+				zap.Int("user_id", req.UserID),
+				zap.Error(err))
+			s.metrics.RecordWalletOperation("exchange", "error_create_wallet")
+			return 0, err
+		}
+	} else {
+		// Update existing wallet
+		newBalance := wallet.Balance + platformAmount
+		s.logger.Debug("Updating wallet balance", 
+			zap.Int("user_id", req.UserID),
+			zap.Float64("old_balance", wallet.Balance),
+			zap.Float64("platform_amount", platformAmount),
+			zap.Float64("new_balance", newBalance))
+			
+		newWallet, err = s.repo.UpdateWalletBalance(ctx, req.UserID, newBalance, tx)
+		if err != nil {
+			s.logger.Error("Failed to update wallet balance", 
+				zap.Int("user_id", req.UserID),
+				zap.Error(err))
+			s.metrics.RecordWalletOperation("exchange", "error_update_wallet")
+			return 0, err
+		}
+	}
+
+	// Create wallet log
+	walletLog := &model.WalletLog{
+		WalletID:       newWallet.ID,
+		UserID:         req.UserID,
+		GameID:         &req.GameID,
+		TokenType:      &req.TokenType,
+		Amount:         req.Amount,
+		PlatformAmount: platformAmount,
+		Source:         model.TransactionExchange,
+	}
+	
+	_, err = s.repo.CreateWalletLog(ctx, walletLog, tx)
 	if err != nil {
+		s.logger.Error("Failed to create wallet log", 
+			zap.Int("user_id", req.UserID),
+			zap.Error(err))
+		s.metrics.RecordWalletOperation("exchange", "error_log")
 		return 0, err
 	}
 
-	// Log transaction
-	_, err = tx.Exec(
-		"INSERT INTO wallet_logs (wallet_id, user_id, game_id, token_type, amount, platform_amount, source) "+
-			"VALUES ($1, $2, $3, $4, $5, $6, $7)",
-		walletID, req.UserID, req.GameID, req.TokenType, req.Amount, platformAmount, req.Source,
-	)
-	if err != nil {
-		return 0, err
-	}
-
-	// Commit transaction
+	// Commit the transaction
 	if err = tx.Commit(); err != nil {
+		s.logger.Error("Failed to commit transaction", 
+			zap.Int("user_id", req.UserID),
+			zap.Error(err))
+		s.metrics.RecordWalletOperation("exchange", "error_commit")
 		return 0, err
 	}
 
-	return newBalance, nil
+	s.logger.Info("Exchange completed successfully", 
+		zap.Int("user_id", req.UserID),
+		zap.Float64("game_amount", req.Amount),
+		zap.Float64("platform_amount", platformAmount),
+		zap.Float64("new_balance", newWallet.Balance))
+	s.metrics.RecordWalletOperation("exchange", "success")
+
+	return newWallet.Balance, nil
 }
 
-func (s *WalletService) Spend(req *dto.SpendRequest) (float64, error) {
-	// Begin transaction
-	tx, err := s.db.Begin()
+func (s *WalletService) Spend(ctx context.Context, req *dto.SpendRequest) (float64, error) {
+	ctx, span := s.tracer.StartSpan(ctx, "WalletService.Spend", 
+		trace.WithAttributes(
+			attribute.Int("user_id", req.UserID),
+			attribute.Float64("amount", req.Amount),
+			attribute.String("reason", req.Reason),
+		))
+	defer span.End()
+
+	s.logger.Info("Processing spend request", 
+		zap.Int("user_id", req.UserID),
+		zap.Float64("amount", req.Amount),
+		zap.String("reason", req.Reason))
+
+	// Start a transaction
+	tx, err := s.repo.BeginTx(ctx)
 	if err != nil {
+		s.logger.Error("Failed to begin transaction", zap.Error(err))
+		s.metrics.RecordWalletOperation("spend", "error_transaction")
 		return 0, err
 	}
 	defer tx.Rollback()
 
 	// Get wallet with lock
-	var walletID int
-	var currentBalance float64
-	err = tx.QueryRow(
-		"SELECT id, balance FROM wallets WHERE user_id = $1 FOR UPDATE",
-		req.UserID,
-	).Scan(&walletID, &currentBalance)
-
-	if err == sql.ErrNoRows {
-		return 0, fmt.Errorf("wallet not found for user_id=%d", req.UserID)
-	}
+	wallet, err := s.repo.GetWalletByUserIDForUpdate(ctx, req.UserID, tx)
 	if err != nil {
+		s.logger.Error("Error getting wallet for update", 
+			zap.Int("user_id", req.UserID),
+			zap.Error(err))
+		s.metrics.RecordWalletOperation("spend", "error_wallet_fetch")
 		return 0, err
 	}
 
+	if wallet == nil {
+		s.logger.Error("Wallet not found for user", zap.Int("user_id", req.UserID))
+		s.metrics.RecordWalletOperation("spend", "error_wallet_not_found")
+		return 0, fmt.Errorf("wallet not found for user_id=%d", req.UserID)
+	}
+	
 	// Check if balance is sufficient
-	if currentBalance < req.Amount {
-		return 0, fmt.Errorf("insufficient funds: current balance %.2f, required %.2f", currentBalance, req.Amount)
+	if wallet.Balance < req.Amount {
+		s.logger.Error("Insufficient funds", 
+			zap.Int("user_id", req.UserID),
+			zap.Float64("current_balance", wallet.Balance),
+			zap.Float64("required_amount", req.Amount))
+		s.metrics.RecordWalletOperation("spend", "error_insufficient_funds")
+		return 0, fmt.Errorf("insufficient funds: current balance %.2f, required %.2f", wallet.Balance, req.Amount)
 	}
 
 	// Update wallet balance
-	newBalance := currentBalance - req.Amount
-	_, err = tx.Exec(
-		"UPDATE wallets SET balance = $1 WHERE id = $2",
-		newBalance, walletID,
-	)
+	updatedWallet, err := s.repo.SpendFromWallet(ctx, req.UserID, req.Amount, tx)
 	if err != nil {
+		s.logger.Error("Failed to spend from wallet", 
+			zap.Int("user_id", req.UserID),
+			zap.Float64("amount", req.Amount),
+			zap.Error(err))
+		s.metrics.RecordWalletOperation("spend", "error_update_wallet")
 		return 0, err
 	}
 
-	// Log transaction
-	_, err = tx.Exec(
-		"INSERT INTO wallet_logs (wallet_id, user_id, amount, platform_amount, source, reference_id) "+
-			"VALUES ($1, $2, $3, $4, $5, $6)",
-		walletID, req.UserID, -req.Amount, -req.Amount, req.Reason, req.ReferenceID,
-	)
+	// Create wallet log
+	walletLog := &model.WalletLog{
+		WalletID:       wallet.ID,
+		UserID:         req.UserID,
+		Amount:         -req.Amount,
+		PlatformAmount: -req.Amount,
+		Source:         req.Reason,
+		ReferenceID:    &req.ReferenceID,
+	}
+	
+	_, err = s.repo.CreateWalletLog(ctx, walletLog, tx)
 	if err != nil {
+		s.logger.Error("Failed to create wallet log", 
+			zap.Int("user_id", req.UserID),
+			zap.Error(err))
+		s.metrics.RecordWalletOperation("spend", "error_log")
 		return 0, err
 	}
 
-	// Commit transaction
+	// Commit the transaction
 	if err = tx.Commit(); err != nil {
+		s.logger.Error("Failed to commit transaction", 
+			zap.Int("user_id", req.UserID),
+			zap.Error(err))
+		s.metrics.RecordWalletOperation("spend", "error_commit")
 		return 0, err
 	}
 
-	return newBalance, nil
+	s.logger.Info("Spend completed successfully", 
+		zap.Int("user_id", req.UserID),
+		zap.Float64("amount", req.Amount),
+		zap.Float64("new_balance", updatedWallet.Balance))
+	s.metrics.RecordWalletOperation("spend", "success")
+
+	return updatedWallet.Balance, nil
 }
 
-func (s *WalletService) GetWalletLogs(userID int) ([]dto.WalletLogEntry, error) {
-	rows, err := s.db.Query(`
-		SELECT 
-			NULLIF(game_id, '') as game_id,
-			NULLIF(token_type, '') as token_type,
-			NULLIF(source, '') as source,
-			ABS(amount) as original_amount,
-			platform_amount as converted_amount,
-			CASE 
-				WHEN game_id IS NOT NULL THEN 'exchange'
-				ELSE 'spend'
-			END as operation,
-			NULLIF(reference_id, '') as reference_id,
-			created_at
-		FROM wallet_logs
-		WHERE user_id = $1
-		ORDER BY created_at DESC`,
-		userID,
-	)
+func (s *WalletService) GetWalletLogs(ctx context.Context, userID int) ([]dto.WalletLogEntry, error) {
+	ctx, span := s.tracer.StartSpan(ctx, "WalletService.GetWalletLogs",
+		trace.WithAttributes(attribute.Int("user_id", userID)))
+	defer span.End()
+
+	s.logger.Info("Getting wallet logs for user", zap.Int("user_id", userID))
+	
+	// Default limits
+	limit := 50
+	offset := 0
+	
+	// Get logs from repository
+	logs, err := s.repo.GetWalletLogs(ctx, userID, limit, offset)
+	
 	if err != nil {
+		s.logger.Error("Error retrieving wallet logs", 
+			zap.Int("user_id", userID),
+			zap.Error(err))
+		s.metrics.RecordWalletOperation("get_logs", "error")
 		return nil, err
 	}
-	defer rows.Close()
 
-	var logs []dto.WalletLogEntry
-	for rows.Next() {
-		var log dto.WalletLogEntry
-		err := rows.Scan(
-			&log.GameID,
-			&log.TokenType,
-			&log.Source,
-			&log.OriginalAmount,
-			&log.ConvertedAmount,
-			&log.Operation,
-			&log.ReferenceID,
-			&log.CreatedAt,
-		)
-		if err != nil {
-			return nil, err
+	s.logger.Debug("Retrieved wallet logs successfully", 
+		zap.Int("user_id", userID),
+		zap.Int("log_count", len(logs)))
+	s.metrics.RecordWalletOperation("get_logs", "success")
+
+	// Convert model to DTO
+	result := make([]dto.WalletLogEntry, len(logs))
+	for i, log := range logs {
+		operation := model.TransactionExchange
+		if log.Amount < 0 {
+			operation = model.TransactionSpend
 		}
-		logs = append(logs, log)
+		
+		source := log.Source
+		
+		entry := dto.WalletLogEntry{
+			OriginalAmount:  log.Amount,
+			ConvertedAmount: log.PlatformAmount,
+			CreatedAt:       log.CreatedAt,
+			Operation:       operation,
+			Source:          &source,
+		}
+		
+		if log.GameID != nil {
+			entry.GameID = log.GameID
+		}
+		
+		if log.TokenType != nil {
+			entry.TokenType = log.TokenType
+		}
+		
+		if log.ReferenceID != nil {
+			entry.ReferenceID = log.ReferenceID
+		}
+		
+		result[i] = entry
 	}
 
-	if err = rows.Err(); err != nil {
-		return nil, err
-	}
-
-	return logs, nil
+	return result, nil
 }

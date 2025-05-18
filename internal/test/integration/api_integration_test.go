@@ -19,11 +19,15 @@ import (
 )
 
 func setupTestApp(t *testing.T) *fiber.App {
-	db := GetTestDB()
-	walletService := service.NewWalletService(db)
-	walletHandler := handler.NewWalletHandler(walletService)
-
+	testRepo := GetTestRepository(t)
 	app := fiber.New()
+
+	// Create observability for test
+	obs := service.GetTestObservability()
+	
+	// Create service and handler with interfaces
+	var walletService service.WalletServiceInterface = service.NewWalletService(testRepo, obs)
+	var walletHandler handler.WalletHandlerInterface = handler.NewWalletHandler(walletService, obs)
 
 	// Setup test routes similar to actual app
 	api := app.Group("/", middleware.AuthMiddleware())

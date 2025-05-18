@@ -1,14 +1,18 @@
 package integration
 
 import (
+	"context"
 	"testing"
 	"time"
 
+	"github.com/playconomy/wallet-service/internal/observability"
+	"github.com/playconomy/wallet-service/internal/repository"
 	"github.com/playconomy/wallet-service/internal/server/dto"
 	"github.com/playconomy/wallet-service/internal/service"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.uber.org/zap"
 )
 
 func TestWalletServiceIntegration(t *testing.T) {
@@ -17,11 +21,22 @@ func TestWalletServiceIntegration(t *testing.T) {
 		t.Skip("skipping integration test in short mode")
 	}
 
-	// Get test DB
-	db := GetTestDB()
+	// Create context for tests
+	ctx := context.Background()
 
-	// Create wallet service with actual DB connection
-	walletService := service.NewWalletService(db)
+	// Get test repository
+	testRepo := GetTestRepository(t)
+
+	// Create test observability
+	logger, _ := zap.NewDevelopment()
+	obs := &observability.Observability{
+		Logger:  &observability.Logger{Logger: logger},
+		Metrics: nil,
+		Tracer:  nil,
+	}
+
+	// Create wallet service with actual repository
+	var walletService service.WalletServiceInterface = service.NewWalletService(testRepo, obs)
 
 	// Clear test data before each test
 	t.Run("GetWalletByUserID", func(t *testing.T) {
@@ -32,7 +47,7 @@ func TestWalletServiceIntegration(t *testing.T) {
 		CreateTestWallet(t, userID, 100.0)
 
 		// Test getting the wallet
-		wallet, err := walletService.GetWalletByUserID(userID)
+		wallet, err := walletService.GetWalletByUserID(ctx, userID)
 
 		// Assert
 		require.NoError(t, err)
@@ -42,7 +57,7 @@ func TestWalletServiceIntegration(t *testing.T) {
 
 		// Test non-existent wallet
 		nonExistentID := 999
-		wallet, err = walletService.GetWalletByUserID(nonExistentID)
+		wallet, err = walletService.GetWalletByUserID(ctx, nonExistentID)
 
 		require.NoError(t, err)
 		assert.Nil(t, wallet)
@@ -61,14 +76,14 @@ func TestWalletServiceIntegration(t *testing.T) {
 		}
 
 		// Execute exchange (should create wallet if it doesn't exist)
-		newBalance, err := walletService.Exchange(req)
+		newBalance, err := walletService.Exchange(ctx, req)
 
 		// Assert
 		require.NoError(t, err)
 		assert.Equal(t, 250.0, newBalance) // 100 * 2.5
 
 		// Verify wallet was created with correct balance
-		wallet, err := walletService.GetWalletByUserID(req.UserID)
+		wallet, err := walletService.GetWalletByUserID(ctx, req.UserID)
 		require.NoError(t, err)
 		assert.NotNil(t, wallet)
 		assert.Equal(t, 250.0, wallet.Balance)
@@ -82,7 +97,7 @@ func TestWalletServiceIntegration(t *testing.T) {
 			Source:    "won",
 		}
 
-		_, err = walletService.Exchange(invalidReq)
+		_, err = walletService.Exchange(ctx, invalidReq)
 		assert.Error(t, err)
 		assert.Contains(t, err.Error(), "exchange rate not found")
 	})
@@ -103,14 +118,14 @@ func TestWalletServiceIntegration(t *testing.T) {
 		}
 
 		// Execute spend
-		newBalance, err := walletService.Spend(req)
+		newBalance, err := walletService.Spend(ctx, req)
 
 		// Assert
 		require.NoError(t, err)
 		assert.Equal(t, 300.0, newBalance) // 500 - 200
 
 		// Verify wallet was updated
-		wallet, err := walletService.GetWalletByUserID(userID)
+		wallet, err := walletService.GetWalletByUserID(ctx, userID)
 		require.NoError(t, err)
 		assert.NotNil(t, wallet)
 		assert.Equal(t, 300.0, wallet.Balance)
@@ -123,7 +138,7 @@ func TestWalletServiceIntegration(t *testing.T) {
 			ReferenceID: "ORDER-456",
 		}
 
-		_, err = walletService.Spend(insufficientReq)
+		_, err = walletService.Spend(ctx, insufficientReq)
 		assert.Error(t, err)
 		assert.Contains(t, err.Error(), "insufficient funds")
 
@@ -135,7 +150,7 @@ func TestWalletServiceIntegration(t *testing.T) {
 			ReferenceID: "ORDER-789",
 		}
 
-		_, err = walletService.Spend(nonExistentReq)
+		_, err = walletService.Spend(ctx, nonExistentReq)
 		assert.Error(t, err)
 		assert.Contains(t, err.Error(), "wallet not found")
 	})
@@ -162,7 +177,7 @@ func TestWalletServiceIntegration(t *testing.T) {
 		require.NoError(t, err)
 
 		// Get logs
-		logs, err := walletService.GetWalletLogs(userID)
+		logs, err := walletService.GetWalletLogs(ctx, userID)
 
 		// Assert
 		require.NoError(t, err)
@@ -181,6 +196,8 @@ func TestWalletServiceIntegration(t *testing.T) {
 				assert.Equal(t, "gold", *log.TokenType)
 				assert.Equal(t, 100.0, log.OriginalAmount)
 				assert.Equal(t, 250.0, log.ConvertedAmount)
+				assert.NotNil(t, log.Source)
+				assert.Equal(t, "won", *log.Source)
 			}
 
 			if log.Operation == "spend" {
@@ -191,6 +208,8 @@ func TestWalletServiceIntegration(t *testing.T) {
 				assert.Equal(t, -50.0, log.ConvertedAmount)
 				assert.NotNil(t, log.ReferenceID)
 				assert.Equal(t, "ORDER-123", *log.ReferenceID)
+				assert.NotNil(t, log.Source)
+				assert.Equal(t, "market_purchase", *log.Source)
 			}
 		}
 
@@ -198,7 +217,7 @@ func TestWalletServiceIntegration(t *testing.T) {
 		assert.True(t, hasSpend, "Should have a spend log entry")
 
 		// Test empty logs
-		logs, err = walletService.GetWalletLogs(999)
+		logs, err = walletService.GetWalletLogs(ctx, 999)
 		require.NoError(t, err)
 		assert.Empty(t, logs)
 	})

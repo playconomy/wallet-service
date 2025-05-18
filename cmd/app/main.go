@@ -3,6 +3,10 @@ package main
 import (
 	"context"
 	"log"
+	"os"
+	"os/signal"
+	"syscall"
+	"time"
 
 	"github.com/playconomy/wallet-service/docs"
 	"github.com/playconomy/wallet-service/internal/module"
@@ -52,15 +56,29 @@ func main() {
 
 	app := fx.New(
 		module.Module,
+		fx.NopLogger, // Disable fx logging to use our own structured logger
 	)
 
-	if err := app.Start(context.Background()); err != nil {
+	// Create a context that's canceled on interrupt signals
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer cancel()
+
+	if err := app.Start(ctx); err != nil {
 		log.Fatalf("Failed to start application: %v", err)
 	}
 
-	<-app.Done()
+	// Wait for interrupt signal
+	<-ctx.Done()
 
-	if err := app.Stop(context.Background()); err != nil {
+	log.Println("Shutdown signal received")
+
+	// Create a new context for graceful shutdown with a timeout of 10 seconds
+	stopCtx, stopCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer stopCancel()
+
+	log.Println("Stopping application gracefully...")
+	if err := app.Stop(stopCtx); err != nil {
 		log.Fatalf("Failed to stop application: %v", err)
 	}
+	log.Println("Application stopped successfully")
 }
